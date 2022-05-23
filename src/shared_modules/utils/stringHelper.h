@@ -17,7 +17,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
-
+#include <memory>
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 
