@@ -547,10 +547,9 @@ class AbstractServer:
                                                             cluster_items=self.cluster_items),
                 host=self.configuration['bind_addr'], port=self.configuration['port'], ssl=ssl_context)
         except OSError as e:
-            self.logger.error(f"Could not start master: {e}")
-            raise KeyboardInterrupt
+            raise exception.WazuhClusterError(3025, extra_message=e)
 
-        self.logger.info(f'Serving on {server.sockets[0].getsockname()}')
+        self.logger.info('Serving on ' + ', '.join([str(socket.getsockname()) for socket in server.sockets]) + '.')
         self.tasks.append(server.serve_forever)
 
         async with server:
