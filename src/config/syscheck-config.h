@@ -11,6 +11,12 @@
 #ifndef SYSCHECKC_H
 #define SYSCHECKC_H
 
+#ifdef WIN32
+#if PATH_MAX < 4096
+#define PATH_MAX 4096
+#endif
+#endif
+
 typedef enum fim_event_mode {
     FIM_SCHEDULED,
     FIM_REALTIME,
