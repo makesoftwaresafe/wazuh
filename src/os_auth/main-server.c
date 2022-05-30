@@ -32,7 +32,7 @@
 #include "wazuh_db/helpers/wdb_global_helpers.h"
 #include "wazuhdb_op.h"
 #include "os_err.h"
-
+#include "generate_cert.h"
 /* Prototypes */
 static void help_authd(char * home_path) __attribute((noreturn));
 static int ssl_error(const SSL *ssl, int ret);
@@ -150,6 +150,7 @@ static int ssl_error(const SSL *ssl, int ret)
 
 int main(int argc, char **argv)
 {
+
     FILE *fp;
     /* Count of pids we are wait()ing on */
     int debug_level = 0;
@@ -186,9 +187,15 @@ int main(int argc, char **argv)
         const char *ca_cert = NULL;
         const char *server_cert = NULL;
         const char *server_key = NULL;
+        const char *cert_val = NULL;
+        const char *cert_key_bits = NULL;
+        const char *cert_key_path = NULL;
+        const char *cert_path = NULL;
+        const char *cert_subj = NULL;
+        bool generate_certifacate = false;
         unsigned short port = 0;
 
-        while (c = getopt(argc, argv, "Vdhtfig:D:p:c:v:sx:k:PF:ar:L"), c != -1) {
+        while (c = getopt(argc, argv, "Vdhtfigyuoj:D:p:c:v:sx:k:PF:ar:L:y:u:o:j:m"), c != -1) {
             switch (c) {
                 case 'V':
                     print_version();
@@ -291,9 +298,92 @@ int main(int argc, char **argv)
                     mwarn("This option no longer applies. The agent limit has been removed.");
                     break;
 
+                case 'w':
+                    if (!optarg) {
+                        merror_exit("-%c needs an argument", c);
+                    }
+
+                    if (!strchr(optarg, 'y') || !strchr(optarg, 'u') || !strchr(optarg, 'i')) {
+                        merror_exit("-%c needs -y time -u bits -o keypath -o certpath");
+                    }
+                    generate_certifacate = true;
+                    break;
+
+                case 'y':
+                    if (generate_certifacate == false) {
+                        merror_exit("-%c needs -w parameter", c);
+                    }
+                    if (!optarg) {
+                        merror_exit("-%c needs an argument", c);
+                    }
+
+                    cert_val = optarg;
+                    break;
+
+                case 'u':
+                    if (generate_certifacate == false) {
+                        merror_exit("-%c needs -w parameter",c );
+                    }
+
+                    if (!optarg) {
+                        merror_exit("-%c needs an argument", c);
+                    }
+                    cert_key_bits = optarg;
+                    break;
+
+                case 'o':
+                    if (generate_certifacate == false) {
+                        merror_exit("-%c needs -w parameter", c);
+                    }
+
+                    if (!optarg) {
+                        merror_exit("-%c needs an argument", c);
+                    }
+
+                    cert_key_path = optarg;
+                    break;
+
+                case 'j':
+                    if (generate_certifacate == false) {
+                        merror_exit("-%c needs -w parameter", c);
+                    }
+
+                    if (!optarg) {
+                        merror_exit("-%c needs an argument", c);
+                    }
+
+                    cert_path = optarg;
+                    break;
+
+                case 'm':
+                    if (generate_certifacate == false) {
+                        merror_exit("-%c needs -w parameter", c);
+                    }
+
+                    if (!optarg) {
+                        merror_exit("-%c needs an argument", c);
+                    }
+
+                    cert_subj = optarg;
+                    break;
                 default:
                     help_authd(home_path);
                     break;
+            }
+        }
+
+        if (generate_certifacate) {
+            unsigned long days_val = strtol(cert_val, NULL, 10);
+            unsigned long key_bits = strtol(cert_key_bits, NULL, 10);
+
+            if (days_val == 0) {
+                merror_exit("Canot set certificate validity to 0 days");
+            }
+            if (generate_cert(days_val, key_bits, cert_key_path, cert_path) == 0) {
+                mdebug2("Certificates generated successfuly");
+                exit(0);
+            } else {
+                merror_exit("Cannot genereate certificates");
             }
         }
 
@@ -367,7 +457,7 @@ int main(int argc, char **argv)
 
     /* Exit here if disabled */
     if (config.flags.disabled) {
-        minfo("Daemon is disabled. Closing.");
+        minfo("Daemon is disabled. Closing.");
         exit(0);
     }
 
@@ -517,7 +607,7 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
     } else {
-        minfo("Port %hu was set as disabled.", config.port);
+        minfo("Port %hu was set as disabled.", config.port);
     }
 
     if (!config.worker_node) {
