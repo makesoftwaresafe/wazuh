@@ -29,6 +29,7 @@ void DB::init(const int storage,
               std::function<void(const std::string&)> callbackSyncRegistryWrapper,
               std::function<void(modules_log_level_t, const std::string&)> callbackLogWrapper,
               const int fileLimit,
+              const uint32_t minSyncIntervalTime,
               const int valueLimit,
               bool syncRegistryEnabled)
 {
@@ -49,7 +50,8 @@ void DB::init(const int storage,
                            rsyncHandler,
                            fileLimit,
                            valueLimit,
-                           syncRegistryEnabled);
+                           syncRegistryEnabled,
+                           minSyncIntervalTime);
 }
 
 void DB::runIntegrity()
@@ -116,6 +118,7 @@ FIMDBErrorCode fim_db_init(int storage,
                            fim_sync_callback_t sync_callback,
                            logging_callback_t log_callback,
                            int file_limit,
+                           uint32_t min_sync_interval_time,
                            int value_limit,
                            bool sync_registry_enabled)
 {
@@ -215,6 +218,7 @@ FIMDBErrorCode fim_db_init(int storage,
                             callbackSyncRegistryWrapper,
                             callbackLogWrapper,
                             file_limit,
+                            min_sync_interval_time,
                             value_limit,
                             sync_registry_enabled);
         retVal = FIMDBErrorCode::FIMDB_OK;
