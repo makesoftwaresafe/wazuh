@@ -1,3 +1,8 @@
+# Copyright (C) 2015, Wazuh Inc.
+# Created by Wazuh, Inc. <info@wazuh.com>.
+# This program is a free software; you can redistribute it and/or modify it under the terms of GPLv2
+
+import ast
 import json
 import re
 import subprocess
@@ -45,7 +50,7 @@ def test_token_raw_format(response):
     assert type(response.text) is str
 
 
-def test_select_key_affected_items(response, select_key):
+def test_select_key_affected_items(response, select_key, flag_nested_key_list=False):
     """Check that all items in response have no other keys than those specified in 'select_key'.
 
     Absence of 'select_key' in response does not raise any error. However, extra keys in response (not specified
@@ -54,9 +59,13 @@ def test_select_key_affected_items(response, select_key):
     Some keys like 'id', 'agent_id', etc. are accepted even if not specified in 'select_key' since
     they ignore the 'select' param in API.
 
-    :param response: Request response
-    :param select_key: Keys requested in select parameter.
-        Lists and nested fields accepted e.g: id,cpu.mhz,json
+    Parameters
+    ----------
+    response : Request response
+    select_key : str
+        Keys requested in select parameter. Lists and nested fields accepted e.g: id,cpu.mhz,json
+    flag_nested_key_list : bool
+        Flag used to indicate that the nested key contains a list.
     """
     main_keys = set()
     nested_keys = dict()
@@ -79,15 +88,50 @@ def test_select_key_affected_items(response, select_key):
 
         # Check if there are keys in response that were not specified in 'select_keys', apart from those which can be
         # mandatory (id, agent_id, etc).
-        assert (set1 == set() or set1 == set1.intersection({'id', 'agent_id', 'file', 'task_id'} | main_keys)), \
-            f'Select keys are {main_keys}, but the response contains these keys: {set1}'
+        assert (set1 == set() or set1 == set1.intersection(
+            {'id', 'agent_id', 'file', 'task_id',
+             'policy_id'} | main_keys)), f'Select keys are {main_keys}, but the response contains these keys: {set1}'
 
         for nested_key in nested_keys.items():
+            # nested_key = compliance, value
             try:
-                set2 = nested_key[1].symmetric_difference(set(item[nested_key[0]].keys()))
+                if not flag_nested_key_list:
+                    set2 = nested_key[1].symmetric_difference(set(item[nested_key[0]].keys()))
+
+                # If we are using select in endpoints like GET /sca/{agent_id}/checks/{policy_id},
+                # the nested field contains a list
+                else:
+                    set2 = nested_key[1].symmetric_difference(set(item[nested_key[0]][0].keys()))
+
                 assert set2 == set(), f'Nested select keys are {nested_key[1]}, but this one is different {set2}'
             except KeyError:
                 assert nested_key[0] in main_keys
+
+
+def test_select_distinct_nested_sca_checks(response, select_key):
+    """Check that all items in response have no other keys than those specified in 'select_key'.
+
+    This function is specifically used for the SCA checks endpoint, when distinct=True and select contains a nested
+    field.
+
+    This function does not take into account min select fields.
+
+    Absence of 'select_key' in response does not raise any error. However, extra keys in response (not specified
+    in 'select_key') will raise assertion error.
+
+    Parameters
+    ----------
+    response : Request response
+    select_key : str
+        Keys requested in select parameter. Lists and nested fields accepted e.g: id,cpu.mhz,json
+    """
+    main_keys = set(select_key.split(','))
+
+    for item in response.json()['data']['affected_items']:
+        # Check that there are no keys in the item that are not specified in 'select_keys'
+        set1 = main_keys.symmetric_difference(set(item.keys()))
+        assert set1 == set() or set1 == set1.intersection(main_keys), \
+            f'Select keys are {main_keys}, but an item contains the keys: {set(item.keys())}'
 
 
 def test_select_key_affected_items_with_agent_id(response, select_key):
@@ -193,7 +237,7 @@ def test_validate_data_dict_field(response, fields_dict):
 
         for element in field_list:
             try:
-                assert (isinstance(element[key], eval(value)) for key, value in dikt.items())
+                assert (isinstance(element[key], ast.literal_eval(value)) for key, value in dikt.items())
             except KeyError:
                 assert len(element) == 1
                 assert isinstance(element['count'], int)
@@ -250,48 +294,6 @@ def test_save_response_data(response):
     return Box({'response_data': response.json()['data']})
 
 
-def test_save_response_data_mitre(response, fields):
-    response = response.json()['data']
-    fields_response = list()
-    for r in response['affected_items']:
-        fields_response.append({k: r[k] for k in fields})
-
-    return Box({'response_data': fields_response})
-
-
-def test_validate_mitre(response, data, index=0):
-    data = json.loads(data.replace("'", '"'))
-    for element in data:
-        for k, v in element.items():
-            assert v == response.json()['data']['affected_items'][index][k]
-
-
-def test_validate_restart_by_node(response, data):
-    data = json.loads(data.replace("'", '"'))
-    affected_items = list()
-    for item in data['affected_items']:
-        if item['status'] == 'active':
-            affected_items.append(item['id'])
-    assert response.json()['data']['affected_items'] == affected_items
-    assert not response.json()['data']['failed_items']
-    healthcheck_agent_restart(response, affected_items)
-
-
-def test_validate_restart_by_node_rbac(response, permitted_agents):
-    data = response.json().get('data', None)
-    if data:
-        if data['affected_items']:
-            healthcheck_agent_restart(response, data['affected_items'])
-            for agent in data['affected_items']:
-                assert agent in permitted_agents
-        else:
-            assert data['total_affected_items'] == 0
-    else:
-        assert response.status_code == 403
-        assert response.json()['error'] == 4000
-        assert 'agent:id' in response.json()['detail']
-
-
 def test_validate_auth_context(response, expected_roles=None):
     """Check that the authorization context has been matched with the correct rules
 
@@ -304,18 +306,6 @@ def test_validate_auth_context(response, expected_roles=None):
     token = response.json()['data']['token'].split('.')[1]
     payload = loads(b64decode(token + '===').decode())
     assert payload['rbac_roles'] == expected_roles
-
-
-def test_validate_syscollector_hotfix(response, hotfix_filter=None, experimental=False):
-    hotfixes_keys = {'hotfix', 'scan_id', 'scan_time'}
-    if experimental:
-        hotfixes_keys.add('agent_id')
-    affected_items = response.json()['data']['affected_items']
-    if affected_items:
-        for item in affected_items:
-            assert set(item.keys()) == hotfixes_keys
-            if hotfix_filter:
-                assert item['hotfix'] == hotfix_filter
 
 
 def test_validate_group_configuration(response, expected_field, expected_value):
@@ -345,6 +335,20 @@ def test_validate_search(response, search_param):
 
 def test_validate_key_not_in_response(response, key):
     assert all(key not in item for item in response.json()["data"]["affected_items"])
+
+
+def test_validate_vd_scans(response, first_node_name, first_node_count, second_node_name, second_node_count,
+                           third_node_name, third_node_count):
+    nodes = []
+    if first_node_count > 0:
+        nodes.append(first_node_name)
+    if second_node_count > 0:
+        nodes.append(second_node_name)
+    if third_node_count > 0:
+        nodes.append(third_node_name)
+
+    # All the names in nodes must be in the response
+    assert all(node in response.json()["data"]["affected_items"] for node in nodes)
 
 
 def check_agentd_started(response, agents_list):
@@ -384,7 +388,7 @@ def check_agentd_started(response, agents_list):
         while tries < 80:
             try:
                 # Save agentd logs in a list
-                command = f"docker exec env_wazuh-agent{int(agent_id)}_1 grep agentd /var/ossec/logs/ossec.log"
+                command = f"docker exec env-wazuh-agent{int(agent_id)}-1 grep agentd /var/ossec/logs/ossec.log"
                 output = subprocess.check_output(command.split()).decode().strip().split('\n')
             except subprocess.SubprocessError as exc:
                 raise subprocess.SubprocessError(f"Error while trying to get logs from agent {agent_id}") from exc
@@ -418,13 +422,13 @@ def check_agent_active_status(agents_list):
     while tries < 25:
         try:
             # Get active agents
-            output = subprocess.check_output(f"docker exec env_wazuh-master_1 /var/ossec/framework/python/bin/python3 "
+            output = subprocess.check_output(f"docker exec env-wazuh-master-1 /var/ossec/framework/python/bin/python3 "
                                              f"{active_agents_script_path}".split()).decode().strip()
         except subprocess.SubprocessError as exc:
             raise subprocess.SubprocessError("Error while trying to get agents") from exc
 
         # Transform string representation of list to list and save agents id
-        id_active_agents = [agent['id'] for agent in eval(output)]
+        id_active_agents = [agent['id'] for agent in ast.literal_eval(output)]
 
         if all(a in id_active_agents for a in agents_list):
             break
@@ -451,3 +455,43 @@ def healthcheck_agent_restart(response, agents_list):
     time.sleep(20)
     # Wait for active agent status (up to 25 seconds)
     check_agent_active_status(agents_list)
+
+
+def validate_update_check_response(response, current_version, update_check):
+    """Check that the update check response contains the expected fields, and verify if the 'last_available_*'
+    dictionaries have the correct keys and values.
+
+    Parameters
+    ----------
+    response : Request response
+    """
+    error_code = response.json()['error']
+    if response.status_code == 500:
+        assert error_code == 2100
+        return
+
+    available_update_keys = ["last_available_major", "last_available_minor", "last_available_patch"]
+    keys_to_check = [
+        ("tag", str), ("description", (str, type(None))), ("title", str), ("published_date", str), ("semver", dict)
+    ]
+
+    data = response.json()['data']
+
+    assert error_code == 0
+    assert data['current_version'] == current_version
+    assert data['update_check'] == update_check
+    assert data['uuid'] is not None
+    last_check_date = data['last_check_date']
+    if update_check:
+        assert last_check_date is not None
+    else:
+        assert last_check_date == ''
+
+    for available_update in available_update_keys:
+        available_update_data = data[available_update]
+
+        assert isinstance(available_update_data, dict)
+
+        if available_update_data != {}:
+            for key, value_type in keys_to_check:
+                assert isinstance(available_update_data[key], value_type)

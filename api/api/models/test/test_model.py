@@ -1,23 +1,26 @@
 # Copyright (C) 2015, Wazuh Inc.
 # Created by Wazuh, Inc. <info@wazuh.com>.
 # This program is a free software; you can redistribute it and/or modify it under the terms of GPLv2
+
 import importlib.util
 import inspect
 import sys
 from json import JSONDecodeError
 from os import listdir
 from os.path import abspath, dirname, join
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from connexion import ProblemException
 
+from api.controllers.util import JSON_CONTENT_TYPE
+from api.models import agent_registration_model
 with patch('wazuh.core.common.wazuh_uid'):
     with patch('wazuh.core.common.wazuh_gid'):
         sys.modules['api.authentication'] = MagicMock()
-        from api.models import base_model_ as bm
-        from wazuh import WazuhError
+        from api.models import base_model_ as bm, agent_registration_model
         from api.util import deserialize_model
+        from wazuh import WazuhError
 
         del sys.modules['api.authentication']
 
@@ -26,7 +29,8 @@ models_path = dirname(dirname(abspath(__file__)))
 
 class TestModel(bm.Body):
     """Test class for custom Model. Body inherits from Model and has all the attributes required for testing."""
-
+    __test__ = False
+    
     def __init__(self, *args):
 
         self.swagger_types = {f"arg_{i + 1}": type(arg) for i, arg in enumerate(args)}
@@ -48,7 +52,7 @@ class RequestMock:
         self._content_type = content_type
 
     @property
-    def content_type(self):
+    def mimetype(self):
         return self._content_type
 
 
@@ -245,7 +249,7 @@ def test_body_decode_body_ko():
 
 def test_body_validate_content_type():
     """Test class Body `validate_content_type` method."""
-    content_type = 'application/json'
+    content_type = JSON_CONTENT_TYPE
     request = RequestMock(content_type)
 
     TestModel.validate_content_type(request, content_type)
@@ -253,7 +257,7 @@ def test_body_validate_content_type():
 
 def test_body_validate_content_type_ko():
     """Test class Body `validate_content_type` method exceptions."""
-    request = RequestMock('application/json')
+    request = RequestMock(JSON_CONTENT_TYPE)
 
     with pytest.raises(ProblemException) as exc:
         TestModel.validate_content_type(request, 'application/xml')
@@ -278,9 +282,39 @@ def test_all_models(deserialize_mock, module_name):
                 instance = module_class()
                 for p in [p for p in module_class.__dict__ if not p.startswith('__')]:
                     # Assert that all its attributes have defined properties (getter and setter)
-                    setattr(instance, p, 'test')
-                    assert getattr(instance, p) == 'test'
+                    value = ''
+                    if module_class.__name__ == 'AgentRegistrationModel' and p == 'key':
+                        value = '7b8276c3bf96aff5709346d368f04aed'
+                    else:
+                        value = 'test'
+
+                    setattr(instance, p, value)
+                    assert getattr(instance, p) == value
 
                 # Test the only possible overwritten method: `from_dict`
                 getattr(module_class, 'from_dict')('test')
                 deserialize_mock.assert_called_with('test', module_class)
+
+
+@pytest.mark.parametrize('key', (
+    '7b8276c3bf96aff5709346d368f04aed',
+    'test',
+    '7b8276c3bf96aff5709346d368f04aedA'
+))
+async def test_agent_registration_model_validation(key):
+    request = {
+        'id': '01929571-49b5-75e8-a3f6-1d2b84f4f71a',
+        'name': 'testing',
+        'key': key,
+        'type': 'endpoint',
+        'version': '5.0.0'
+    }
+
+    if len(key) != agent_registration_model.KEY_LENGTH:
+        with pytest.raises(ProblemException) as exc:
+            await agent_registration_model.AgentRegistrationModel.get_kwargs(request)
+
+        assert exc.value.title == 'Invalid key length'
+        assert exc.value.detail == 'The key must be 32 characters long'
+    else:
+        await agent_registration_model.AgentRegistrationModel.get_kwargs(request)

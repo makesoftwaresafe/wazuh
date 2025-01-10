@@ -80,11 +80,12 @@ def get_agent_health_base():
             if not agent_restarted and re.match(r'.*Agent is restarting due to shared configuration changes.*', log):
                 agent_restarted = True
             if agent_restarted and re.match(r'.*Connected to the server.*', log):
-                # Wait to avoid the worst case:
-                # +10 seconds for the agent to report the worker
-                # +10 seconds for the worker to report master
-                # After this time, the agent appears as active in the master node
-                time.sleep(20)
+                # Wait to avoid the worst case scenario:
+                # +10 seconds for the agent to report to the worker
+                # +10 seconds for the worker to report to the master
+                # +10 seconds for the shared configuration to be synced
+                # After this time, the agent appears as active and synced in the master node
+                time.sleep(30)
                 return 0
     return 1
 
@@ -101,16 +102,7 @@ def get_master_health(env_mode):
     os.system("/var/ossec/bin/wazuh-control status > /tmp_volume/daemons.txt")
 
     check0 = check(os.system("diff -q /tmp_volume/output.txt /tmp_volume/healthcheck/agent_control_check.txt"))
-
-    if env_mode == "standalone":
-        # If the environment is in standalone mode, the only difference is in the clusterd daemon
-        check1 = check(not
-                       (subprocess.run(['diff', '/tmp_volume/daemons.txt', '/tmp_volume/healthcheck/daemons_check.txt'],
-                                       stdout=subprocess.PIPE).stdout.decode('utf-8')
-                        == CHECK_CLUSTERD_DAEMON))
-    else:
-        check1 = check(os.system("diff -q /tmp_volume/daemons.txt /tmp_volume/healthcheck/daemons_check.txt"))
-
+    check1 = check(os.system("diff -q /tmp_volume/daemons.txt /tmp_volume/healthcheck/daemons_check.txt"))
     check2 = get_api_health()
 
     return check0 or check1 or check2
