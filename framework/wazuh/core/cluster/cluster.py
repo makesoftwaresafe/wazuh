@@ -1,6 +1,7 @@
 # Copyright (C) 2015, Wazuh Inc.
 # Created by Wazuh, Inc. <info@wazuh.com>.
 # This program is a free software; you can redistribute it and/or modify it under the terms of GPLv2
+
 import errno
 import itertools
 import json
@@ -9,28 +10,102 @@ import os.path
 import shutil
 import zlib
 from asyncio import wait_for
+from collections import defaultdict
 from functools import partial
-from operator import eq
 from os import listdir, path, remove, stat, walk
 from uuid import uuid4
 
+from jsonschema import ValidationError, validate, validators
 from wazuh import WazuhError, WazuhException, WazuhInternalError
 from wazuh.core import common
+from wazuh.core.cluster.utils import (
+    AGENT_CHUNK_SIZE,
+    AGENT_RECONNECTION_STABILITY_TIME,
+    AGENT_RECONNECTION_TIME,
+    FREQUENCY,
+    HAPROXY_HELPER,
+    HAPROXY_PORT,
+    HAPROXY_PROTOCOL,
+    IMBALANCE_TOLERANCE,
+    REMOVE_DISCONNECTED_NODE_AFTER
+)
 from wazuh.core.InputValidator import InputValidator
-from wazuh.core.agent import WazuhDBQueryAgents
-from wazuh.core.cluster.utils import get_cluster_items, read_config
-from wazuh.core.utils import blake2b, mkdir_with_mode, get_utc_now, get_date_from_timestamp
+from wazuh.core.utils import blake2b, get_date_from_timestamp, get_utc_now, mkdir_with_mode
+from wazuh.core.config.client import CentralizedConfig
 
 logger = logging.getLogger('wazuh')
 
 # Separators used in compression/decompression functions to delimit files.
-FILE_SEP = '|@!@|'
-PATH_SEP = '|!@!|'
+FILE_SEP = '|@@//@@|'
+PATH_SEP = '|//@@//|'
+MIN_PORT = 1024
+MAX_PORT = 65535
 
+HAPROXY_HELPER_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        HAPROXY_PORT: {'type': 'integer', 'minimum': MIN_PORT, 'maximum': MAX_PORT},
+        HAPROXY_PROTOCOL: {'type': 'string', 'enum': ['http', 'https']},
+        FREQUENCY: {'type': 'integer', 'minimum': 10},
+        AGENT_RECONNECTION_STABILITY_TIME: {'type': 'integer', 'minimum': 10},
+        AGENT_CHUNK_SIZE: {'type': 'integer', 'minimum': 100},
+        AGENT_RECONNECTION_TIME: {'type': 'integer', 'minimum': 0},
+        IMBALANCE_TOLERANCE: {'type': 'number', 'exclusiveMinimum': 0, 'maximum': 1},
+        REMOVE_DISCONNECTED_NODE_AFTER: {'type': 'integer', 'minimum': 0},
+    },
+}
 
 #
 # Cluster
 #
+
+def validate_haproxy_helper_config(config: dict):
+    """Validate the values of the give HAProxy helper configuration.
+
+    Parameters
+    ----------
+    config : dict
+        Configuration to validate.
+
+    Raises
+    ------
+    WazuhError(3004)
+        If there any invalid value.
+    """
+    try:
+        validate(config, HAPROXY_HELPER_SCHEMA, cls=validators.Draft202012Validator)
+    except ValidationError as error:
+        raise WazuhError(
+            3004,
+            f'Invalid value for {error.path.pop()}. {error.message}'
+        )
+
+
+def validate_file_path(config: dict, key: str):
+    """Validate a file path is within WAZUH_ETC and that the file exists.
+
+    Parameters
+    ----------
+    config : dict
+        Configuration to validate.
+    key : str
+        Key of the configuration where the file path is stored.
+
+    Raises
+    ------
+    WazuhError(3004)
+        If the file path is invalid.
+    """
+    filepath = config[key]
+
+    if not filepath.is_relative_to(common.WAZUH_ETC):
+        raise WazuhError(3004, f'The {key} path ({filepath}) is not inside {common.WAZUH_ETC}.')
+
+    if '..' in str(filepath):
+        raise WazuhError(3004, f'The {key} path ({filepath}) contains "..".')
+
+    if not filepath.exists():
+        raise WazuhError(3004, f'The {key} "{filepath}" does not exist.')
 
 
 def check_cluster_config(config):
@@ -38,12 +113,11 @@ def check_cluster_config(config):
 
     Following points are checked:
         - Cluster config block is not empty.
-        - len(key) == 32 and only alphanumeric characters are used.
         - node_type is 'master' or 'worker'.
         - Port is an int type.
         - 1024 < port < 65535.
         - Only 1 node is specified.
-        - Reserved IPs are not used.
+        - CAfile, certfile and keyfile paths exist.
 
     Parameters
     ----------
@@ -56,32 +130,29 @@ def check_cluster_config(config):
         If any of above conditions is not met.
     """
     iv = InputValidator()
-    reservated_ips = {'localhost', 'NODE_IP', '0.0.0.0', '127.0.1.1'}
 
-    if len(config['key']) == 0:
-        raise WazuhError(3004, 'Unspecified key')
-
-    elif not iv.check_name(config['key']) or not iv.check_length(config['key'], 32, eq):
-        raise WazuhError(3004, 'Key must be 32 characters long and only have alphanumeric characters')
-
-    elif config['node_type'] != 'master' and config['node_type'] != 'worker':
+    if config['node_type'] != 'master' and config['node_type'] != 'worker':
         raise WazuhError(3004, f'Invalid node type {config["node_type"]}. Correct values are master and worker')
 
-    elif not isinstance(config['port'], int):
+    if not isinstance(config['port'], int):
         raise WazuhError(3004, "Port has to be an integer.")
 
-    elif not 1024 < config['port'] < 65535:
-        raise WazuhError(3004, "Port must be higher than 1024 and lower than 65535.")
+    if not MIN_PORT < config['port'] < MAX_PORT:
+        raise WazuhError(3004, f"Port must be higher than {MIN_PORT} and lower than {MAX_PORT}.")
+
+    cert_keys = ['cafile', 'certfile', 'keyfile']
+    if len(cert_keys) > len(set(config[key] for key in cert_keys)):
+        raise WazuhError(3004, 'Paths to certificates and keys must be different.')
+
+    for key in cert_keys:
+        validate_file_path(config, key)
 
     if len(config['nodes']) > 1:
         logger.warning(
             "Found more than one node in configuration. Only master node should be specified. Using {} as master.".
                 format(config['nodes'][0]))
 
-    invalid_elements = list(reservated_ips & set(config['nodes']))
-
-    if len(invalid_elements) != 0:
-        raise WazuhError(3004, f"Invalid elements in node fields: {', '.join(invalid_elements)}.")
+    validate_haproxy_helper_config(config.get(HAPROXY_HELPER, {}))
 
 
 def get_node():
@@ -90,27 +161,15 @@ def get_node():
     Returns
     -------
     data : dict
-        Dict containing current node_name, node_type and cluster_name.
+        Dict containing current node_name and node_type.
     """
     data = {}
-    config_cluster = read_config()
+    server_config = CentralizedConfig.get_server_config()
 
-    data["node"] = config_cluster["node_name"]
-    data["cluster"] = config_cluster["name"]
-    data["type"] = config_cluster["node_type"]
+    data["node"] = server_config.node.name
+    data["type"] = server_config.node.type
 
     return data
-
-
-def check_cluster_status():
-    """Get whether cluster is enabled in current active configuration.
-
-    Returns
-    -------
-    bool
-        Whether cluster is enabled.
-    """
-    return not read_config()['disabled']
 
 
 #
@@ -145,12 +204,14 @@ def walk_dir(dirname, recursive, files, excluded_files, excluded_extensions, get
     -------
     walk_files : dict
         Paths (keys) and metadata (values) of the requested files found inside 'dirname'.
+    result_logs: dict
+        Dict containing debug or any error messages emitted in the process.
     """
     if previous_status is None:
         previous_status = {}
     walk_files = {}
-
-    full_dirname = path.join(common.WAZUH_PATH, dirname)
+    result_logs = {'debug': defaultdict(list), 'error': defaultdict(list)}
+    full_dirname = path.join(common.WAZUH_ETC, dirname)
     # Get list of all files and directories inside 'full_dirname'.
     try:
         for root_, _, files_ in walk(full_dirname, topdown=True):
@@ -163,7 +224,7 @@ def walk_dir(dirname, recursive, files, excluded_files, excluded_extensions, get
                     try:
                         #  If 'all' files have been requested or entry is in the specified files list.
                         if files == ['all'] or file_ in files:
-                            relative_file_path = path.join(path.relpath(root_, common.WAZUH_PATH), file_)
+                            relative_file_path = path.join(path.relpath(root_, common.WAZUH_ETC), file_)
                             abs_file_path = path.join(root_, file_)
                             file_mod_time = path.getmtime(abs_file_path)
                             try:
@@ -183,18 +244,18 @@ def walk_dir(dirname, recursive, files, excluded_files, excluded_extensions, get
                                 file_metadata['merge_type'] = 'TYPE'
                                 file_metadata['merge_name'] = abs_file_path
                             if get_hash:
-                                file_metadata['blake2_hash'] = blake2b(abs_file_path)
+                                file_metadata['hash'] = blake2b(abs_file_path)
                             # Use the relative file path as a key to save its metadata dictionary.
                             walk_files[relative_file_path] = file_metadata
                     except FileNotFoundError as e:
-                        logger.debug(f"File {file_} was deleted in previous iteration: {e}")
+                        result_logs['debug'][root_].append(f"File {file_} was deleted in previous iteration: {e}")
                     except PermissionError as e:
-                        logger.error(f"Can't read metadata from file {file_}: {e}")
+                        result_logs['error'][root_].append(f"Can't read metadata from file {file_}: {e}")
             else:
                 break
     except OSError as e:
         raise WazuhInternalError(3015, e)
-    return walk_files
+    return walk_files, result_logs
 
 
 def get_files_status(previous_status=None, get_hash=True):
@@ -211,24 +272,33 @@ def get_files_status(previous_status=None, get_hash=True):
     -------
     final_items : dict
         Paths (keys) and metadata (values) of all the files requested in cluster.json['files'].
+    result_logs: dict
+        Dict containing debug or any error messages emitted in the process.
     """
     if previous_status is None:
         previous_status = {}
 
-    cluster_items = get_cluster_items()
+    server_config = CentralizedConfig.get_internal_server_config()
 
     final_items = {}
-    for file_path, item in cluster_items['files'].items():
-        if file_path == "excluded_files" or file_path == "excluded_extensions":
+    result_logs = {'debug': defaultdict(dict), 'warning': defaultdict(list), 'error': defaultdict(dict)}
+    for file_config in server_config.files:
+        if file_config.dir == "excluded_files" or file_config.dir == "excluded_extensions":
             continue
         try:
-            final_items.update(
-                walk_dir(file_path, item['recursive'], item['files'], cluster_items['files']['excluded_files'],
-                         cluster_items['files']['excluded_extensions'], file_path, previous_status, get_hash))
+            items, logs = walk_dir(file_config.dir, file_config.recursive, file_config.names,
+                                   server_config.excluded_files,
+                                   server_config.excluded_extensions,
+                                   file_config.dir, previous_status, get_hash)
+            if 'debug' in logs and logs['debug']:
+                result_logs['debug'][file_config.dir].update(dict(logs['debug']))
+            if 'error' in logs and logs['error']:
+                result_logs['error'][file_config.dir].update(dict(logs['error']))
+            final_items.update(items)
         except Exception as e:
-            logger.warning(f"Error getting file status: {e}.")
+            result_logs['warning'][file_config.dir].append(f"Error getting file status: {e}.")
 
-    return final_items
+    return final_items, result_logs
 
 
 def update_cluster_control(failed_file, ko_files, exists=True):
@@ -284,14 +354,18 @@ def compress_files(name, list_path, cluster_control_json=None, max_zip_size=None
     -------
     compress_file_path : str
         Path where the compress file has been saved.
+    result_logs: dict
+        Dict containing warning and debug messages emitted in the process.
     """
     zip_size = 0
     exceeded_size = False
-    compress_level = get_cluster_items()['intervals']['communication']['compress_level']
+    result_logs = {'warning': defaultdict(list), 'debug': defaultdict(list)}
+    server_config = CentralizedConfig.get_server_config()
+
+    compress_level = server_config.communications.zip.compress_level
     if max_zip_size is None:
-        max_zip_size = get_cluster_items()['intervals']['communication']['max_zip_size']
-    zip_file_path = path.join(common.WAZUH_PATH, 'queue', 'cluster', name,
-                              f'{name}-{get_utc_now().timestamp()}-{uuid4().hex}.zip')
+        max_zip_size = server_config.communications.zip.max_size
+    zip_file_path = path.join(common.WAZUH_QUEUE, name, f'{name}-{get_utc_now().timestamp()}-{uuid4().hex}.zip')
 
     if not path.exists(path.dirname(zip_file_path)):
         mkdir_with_mode(path.dirname(zip_file_path))
@@ -303,10 +377,11 @@ def compress_files(name, list_path, cluster_control_json=None, max_zip_size=None
                 continue
 
             try:
-                with open(path.join(common.WAZUH_PATH, file), 'rb') as rf:
+                with open(path.join(common.WAZUH_ETC, file), 'rb') as rf:
                     new_file = rf.read()
                     if len(new_file) > max_zip_size:
-                        logger.warning(f'File too large to be synced: {path.join(common.WAZUH_PATH, file)}')
+                        result_logs['warning'][file].append(f'File too large to be synced: '
+                                                            f'{path.join(common.WAZUH_ETC, file)}')
                         update_cluster_control(file, cluster_control_json)
                         continue
                     # Compress the content of each file and surrounds it with separators.
@@ -319,13 +394,14 @@ def compress_files(name, list_path, cluster_control_json=None, max_zip_size=None
                     wf.write(new_file)
                 else:
                     # Otherwise, remove it from cluster_control_json.
-                    logger.warning('Maximum zip size exceeded. Not all files will be compressed during this sync.')
+                    result_logs['warning'][file].append('Maximum zip size exceeded. '
+                                                        'Not all files will be compressed during this sync.')
                     exceeded_size = True
                     update_cluster_control(file, cluster_control_json)
             except zlib.error as e:
                 raise WazuhError(3001, str(e))
             except Exception as e:
-                logger.debug(str(WazuhException(3001, str(e))))
+                result_logs['debug'][file].append("Exception raised: " + str(WazuhException(3001, str(e))))
                 update_cluster_control(file, cluster_control_json, exists=False)
 
         try:
@@ -335,7 +411,7 @@ def compress_files(name, list_path, cluster_control_json=None, max_zip_size=None
         except Exception as e:
             raise WazuhError(3001, str(e))
 
-    return zip_file_path
+    return zip_file_path, result_logs
 
 
 async def async_decompress_files(zip_path, ko_files_name="files_metadata.json"):
@@ -467,9 +543,9 @@ def compare_files(good_files, check_files, node_name):
         l1, l2 = itertools.tee((condition(item), item) for item in seq)
         return (i for p, i in l1 if p), (i for p, i in l2 if not p)
 
-    # Get 'files' dictionary inside cluster.json to read options for each file depending on their
+    # Get 'SharedFiles' object  to read options for each file depending on their
     # directory (permissions, if extra_valid files, etc).
-    cluster_items = get_cluster_items()['files']
+    server_config = CentralizedConfig.get_internal_server_config()
 
     # Missing files will be the ones that are present in good files (master) but not in the check files (worker).
     missing_files = {key: good_files[key] for key in good_files.keys() - check_files.keys()}
@@ -477,8 +553,11 @@ def compare_files(good_files, check_files, node_name):
     # Extra files are the ones present in check files (worker) but not in good files (master). The underscore is used
     # to not change the function, as previously it returned an iterator for the 'extra_valid' files as well, but these
     # are no longer in use.
-    _extra_valid, extra = split_on_condition(check_files.keys() - good_files.keys(),
-                                  lambda x: cluster_items[check_files[x]['cluster_item_key']]['extra_valid'])
+    condition_func = lambda x: next(
+        (file_config.extra_valid for file_config in server_config.files if file_config.dir == check_files[x]['cluster_item_key']),
+        False
+    )
+    _extra_valid, extra = split_on_condition(check_files.keys() - good_files.keys(), condition_func)
     extra_files = {key: check_files[key] for key in extra}
     # extra_valid_files = {key: check_files[key] for key in _extra_valid}
 
@@ -488,14 +567,12 @@ def compare_files(good_files, check_files, node_name):
     #     extra_valid_function()
 
     # 'all_shared' files are the ones present in both sets but with different BLAKE2b checksum.
-    all_shared = [x for x in check_files.keys() & good_files.keys() if
-                  check_files[x]['blake2_hash'] != good_files[x]['blake2_hash']]
+    all_shared = [x for x in check_files.keys() & good_files.keys() if check_files[x]['hash'] != good_files[x]['hash']]
 
     # 'shared_e_v' are files present in both nodes but need to be merged before sending them to the worker. Only
     # 'agent-groups' files fit into this category.
     # 'shared' files can be sent as is, without merging.
-    shared_e_v, shared = split_on_condition(all_shared,
-                                            lambda x: cluster_items[check_files[x]['cluster_item_key']]['extra_valid'])
+    shared_e_v, shared = split_on_condition(all_shared, condition_func)
     shared_e_v = list(shared_e_v)
     if shared_e_v:
         # Merge all shared extra valid files into a single one. Create a tuple (merged_filepath, {metadata_dict}).
@@ -536,7 +613,7 @@ def clean_up(node_name=""):
             return
 
         for f in listdir(local_rm_path):
-            if f == "c-internal.sock":
+            if f == common.LOCAL_SERVER_SOCKET:
                 continue
             f_path = path.join(local_rm_path, f)
             try:
@@ -549,7 +626,7 @@ def clean_up(node_name=""):
                 continue
 
     try:
-        rm_path = path.join(common.WAZUH_PATH, 'queue', 'cluster', node_name)
+        rm_path = path.join(common.WAZUH_QUEUE, node_name)
         logger.debug(f"Removing '{rm_path}'.")
         remove_directory_contents(rm_path)
         logger.debug(f"Removed '{rm_path}'.")
@@ -584,12 +661,12 @@ def merge_info(merge_type, node_name, files=None, file_type=""):
     output_file : str
         Path to the created merged file.
     """
-    merge_path = path.join(common.WAZUH_PATH, 'queue', merge_type)
-    output_file = path.join('queue', 'cluster', node_name, merge_type + file_type + '.merged')
+    merge_path = path.join(common.WAZUH_QUEUE, merge_type)
+    output_file = path.join('cluster', node_name, merge_type + file_type + '.merged')
     files_to_send = 0
     files = "all" if files is None else {path.basename(f) for f in files}
 
-    with open(path.join(common.WAZUH_PATH, output_file), 'wb') as o_f:
+    with open(path.join(common.WAZUH_RUN, output_file), 'wb') as o_f:
         for filename in listdir(merge_path):
             if files != "all" and filename not in files:
                 continue

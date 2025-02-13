@@ -4,8 +4,10 @@
 
 from contextvars import ContextVar
 from unittest.mock import patch
-from wazuh.tests.test_security import db_setup
+
 import pytest
+
+from wazuh.tests.test_security import db_setup  # noqa
 
 
 @patch('yaml.safe_load')
@@ -36,12 +38,11 @@ def test_revoke_tokens(db_setup):
     db_setup: callable
         This function creates the rbac.db file.
     """
-    with patch('wazuh.core.security.change_keypair', side_effect=None):
-        security, WazuhResult, _ = db_setup
-        mock_current_user = ContextVar('current_user', default='wazuh')
-        with patch("wazuh.sca.common.current_user", new=mock_current_user):
-            result = security.revoke_current_user_tokens()
-            assert isinstance(result, WazuhResult)
+    security, WazuhResult, _ = db_setup
+    mock_current_user = ContextVar('current_user', default='wazuh')
+    with patch("wazuh.core.common.current_user", new=mock_current_user):
+        result = security.revoke_current_user_tokens()
+        assert isinstance(result, WazuhResult)
 
 
 @pytest.mark.parametrize('role_list, expected_roles', [
@@ -125,3 +126,15 @@ def test_invalid_users_tokens(db_setup, user_list, expected_users):
         core_security.invalid_users_tokens(users=[user_id for user_id in user_list])
         related_users = TM_mock.call_args.kwargs['users']
         assert set(related_users) == expected_users
+
+
+@patch("wazuh.core.security.revoke_tokens")
+@patch("wazuh.core.security.check_database_integrity")
+@patch("wazuh.core.security.os.remove")
+def test_rbac_db_factory_reset(remove_mock, db_integrity_mock, revoke_mock, db_setup):
+    """Check that the RBAC database factory reset is correct."""
+    _, _, core_security = db_setup
+    assert core_security.rbac_db_factory_reset() == {'reset': True}
+    assert remove_mock.call_args[0][0].name == "rbac.db"
+    db_integrity_mock.assert_called_once()
+    revoke_mock.assert_called_once()

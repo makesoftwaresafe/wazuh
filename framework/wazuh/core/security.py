@@ -7,12 +7,8 @@ from functools import lru_cache
 
 import yaml
 
-import api.middlewares as middlewares
-from api import __path__ as api_path
-from api.authentication import change_keypair
-from api.constants import SECURITY_CONFIG_PATH
-from wazuh import WazuhInternalError, WazuhError
-from wazuh.rbac.orm import RolesManager, TokenManager
+from server_management_api import __path__ as api_path
+from wazuh.rbac.orm import RolesManager, TokenManager, check_database_integrity, DB_FILE
 
 REQUIRED_FIELDS = ['id']
 SORT_FIELDS = ['id', 'name']
@@ -25,40 +21,18 @@ def load_spec():
         return yaml.safe_load(stream)
 
 
-def update_security_conf(new_config):
-    """Update dict and write it in the configuration file.
-
-    Parameters
-    ----------
-    new_config : dict
-        Dictionary with the new configuration.
-    """
-    if new_config:
-        try:
-            with open(SECURITY_CONFIG_PATH, 'w+') as f:
-                yaml.dump(new_config, f)
-        except IOError:
-            raise WazuhInternalError(1005)
-    else:
-        raise WazuhError(4021)
-    if 'max_login_attempts' in new_config.keys():
-        middlewares.ip_stats = dict()
-        middlewares.ip_block = set()
-    if 'max_request_per_minute' in new_config.keys():
-        middlewares.request_counter = 0
-
-
-def check_relationships(roles: list = None):
-    """Check the users related with the specified list of roles
+def check_relationships(roles: list = None) -> set:
+    """Check the users related with the specified list of roles.
 
     Parameters
     ----------
     roles : list
-        List of affected roles
+        List of affected roles.
 
     Returns
     -------
-    Set with all affected users
+    set
+        Set with all affected users.
     """
     users_affected = set()
     if roles:
@@ -70,14 +44,13 @@ def check_relationships(roles: list = None):
 
 
 def invalid_run_as_tokens():
-    """Add the necessary rules to invalidate all affected run_as's tokens
-    """
+    """Add the necessary rules to invalidate all affected run_as's tokens."""
     with TokenManager() as tm:
         tm.add_user_roles_rules(run_as=True)
 
 
 def invalid_users_tokens(users: list = None):
-    """Add the necessary rules to invalidate all affected user's tokens
+    """Add the necessary rules to invalidate all affected user's tokens.
 
     Parameters
     ----------
@@ -100,9 +73,14 @@ def invalid_roles_tokens(roles: list = None):
         tm.add_user_roles_rules(roles=set(roles))
 
 
-def revoke_tokens():
-    """Revoke all tokens in current node."""
-    change_keypair()
+def revoke_tokens() -> dict:
+    """Revoke all tokens in current node.
+
+    Returns
+    -------
+    dict
+        Confirmation message.
+    """
     with TokenManager() as tm:
         tm.delete_all_rules()
 
@@ -127,3 +105,15 @@ def sanitize_rbac_policy(policy):
     # Sanitize effect
     if 'effect' in policy:
         policy['effect'] = policy['effect'].lower()
+
+
+def rbac_db_factory_reset():
+    """Reset the RBAC database to default values."""
+    try:
+        os.remove(DB_FILE)
+    except FileNotFoundError:
+        pass
+
+    check_database_integrity()
+    revoke_tokens()
+    return {'reset': True}
